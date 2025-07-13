@@ -334,6 +334,15 @@ source: crates/oxc_linter/src/tester.rs
    ╰────
   help: Extract the expression to a separate variable so it can be statically checked.
 
+  ⚠ eslint-plugin-react-hooks(exhaustive-deps): The literal is not a valid dependency because it never changes.
+   ╭─[exhaustive_deps.tsx:2:31]
+ 1 │ function MyComponent() {
+ 2 │           useEffect(() => {}, ['foo']);
+   ·                               ───────
+ 3 │         }
+   ╰────
+  help: Remove the literal from the array.
+
   ⚠ eslint-plugin-react-hooks(exhaustive-deps): React Hook useEffect has a complex expression in the dependency array.
    ╭─[exhaustive_deps.tsx:4:15]
  3 │             console.log(foo, bar, baz);
@@ -351,6 +360,15 @@ source: crates/oxc_linter/src/tester.rs
  5 │         }
    ╰────
   help: Extract the expression to a separate variable so it can be statically checked.
+
+  ⚠ eslint-plugin-react-hooks(exhaustive-deps): The literal is not a valid dependency because it never changes.
+   ╭─[exhaustive_deps.tsx:4:14]
+ 3 │             console.log(foo, bar, baz);
+ 4 │           }, ['foo', 'bar']);
+   ·              ──────────────
+ 5 │         }
+   ╰────
+  help: Remove the literal from the array.
 
   ⚠ eslint-plugin-react-hooks(exhaustive-deps): React Hook useEffect has missing dependencies: 'bar', 'foo', and 'baz'
    ╭─[exhaustive_deps.tsx:4:14]
@@ -387,6 +405,15 @@ source: crates/oxc_linter/src/tester.rs
  5 │         }
    ╰────
   help: Extract the expression to a separate variable so it can be statically checked.
+
+  ⚠ eslint-plugin-react-hooks(exhaustive-deps): The literal is not a valid dependency because it never changes.
+   ╭─[exhaustive_deps.tsx:4:14]
+ 3 │             console.log(foo, bar, baz);
+ 4 │           }, [42, false, null]);
+   ·              ─────────────────
+ 5 │         }
+   ╰────
+  help: Remove the literal from the array.
 
   ⚠ eslint-plugin-react-hooks(exhaustive-deps): React Hook useEffect has missing dependencies: 'bar', 'foo', and 'baz'
    ╭─[exhaustive_deps.tsx:4:14]

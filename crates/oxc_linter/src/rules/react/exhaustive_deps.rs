@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use oxc_ast::{
     AstKind, AstType,
     ast::{
-        Argument, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern,
+        Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern,
         BindingPatternKind, CallExpression, ChainElement, Expression, FormalParameters, Function,
         FunctionBody, IdentifierReference, StaticMemberExpression, TSTypeAnnotation,
         TSTypeParameterInstantiation, TSTypeReference, VariableDeclarationKind, VariableDeclarator,
@@ -218,7 +218,8 @@ declare_oxc_lint!(
     /// ```
     ExhaustiveDeps,
     react,
-    correctness
+    correctness,
+    fix
 );
 
 const HOOKS_USELESS_WITHOUT_DEPENDENCIES: [&str; 2] = ["useCallback", "useMemo"];
@@ -273,10 +274,24 @@ impl Rule for ExhaustiveDeps {
 
         if dependencies_node.is_none() && !is_effect {
             if HOOKS_USELESS_WITHOUT_DEPENDENCIES.contains(&hook_name.as_str()) {
-                ctx.diagnostic(dependency_array_required_diagnostic(
-                    hook_name.as_str(),
-                    call_expr.span(),
-                ));
+                // Apply dependency array addition fix if safe
+                if is_safe_to_add_dependency_array(hook_name.as_str()) {
+                    ctx.diagnostic_with_fix(
+                        dependency_array_required_diagnostic(hook_name.as_str(), call_expr.span()),
+                        |fixer| {
+                            let insert_span = oxc_span::Span::new(
+                                call_expr.arguments[callback_index].span().end,
+                                call_expr.arguments[callback_index].span().end
+                            );
+                            fixer.replace(insert_span, ", []")
+                        }
+                    );
+                } else {
+                    ctx.diagnostic(dependency_array_required_diagnostic(
+                        hook_name.as_str(),
+                        call_expr.span(),
+                    ));
+                }
             }
             return;
         }
@@ -516,6 +531,16 @@ impl Rule for ExhaustiveDeps {
             declared_dependencies
         };
 
+        // Apply literal dependency fix if safe
+        if is_safe_to_fix_literals(dependencies_node) {
+            let diagnostic = literal_in_dependency_array_diagnostic(dependencies_node.span);
+            ctx.diagnostic_with_fix(diagnostic, |fixer| {
+                let non_literal_deps = extract_non_literal_dependencies(dependencies_node, ctx.semantic());
+                let new_array_content = format_dependency_array(&non_literal_deps);
+                fixer.replace(dependencies_node.span, new_array_content)
+            });
+        }
+
         for dependency in &declared_dependencies {
             if let Some(symbol_id) = dependency.symbol_id {
                 let dependency_scope_id = ctx.scoping().symbol_scope_id(symbol_id);
@@ -556,11 +581,26 @@ impl Rule for ExhaustiveDeps {
         });
 
         if undeclared_deps.clone().count() > 0 {
-            ctx.diagnostic(missing_dependency_diagnostic(
-                hook_name,
-                &undeclared_deps.map(Dependency::to_string).collect::<Vec<_>>(),
-                dependencies_node.span(),
-            ));
+            let missing_deps: Vec<String> = undeclared_deps.map(Dependency::to_string).collect();
+            
+            // Apply missing dependency fix if safe
+            if is_safe_to_fix_missing_dependencies(&missing_deps, &found_dependencies) {
+                ctx.diagnostic_with_fix(
+                    missing_dependency_diagnostic(hook_name, &missing_deps, dependencies_node.span()),
+                    |fixer| {
+                        let existing_deps = extract_dependency_names_from_array(dependencies_node, ctx.semantic());
+                        let merged_deps = merge_dependencies(existing_deps, &missing_deps);
+                        let new_array_content = format_dependency_array(&merged_deps);
+                        fixer.replace(dependencies_node.span, new_array_content)
+                    }
+                );
+            } else {
+                ctx.diagnostic(missing_dependency_diagnostic(
+                    hook_name,
+                    &missing_deps,
+                    dependencies_node.span(),
+                ));
+            }
         }
 
         // effects are allowed to have extra dependencies
@@ -3943,11 +3983,190 @@ fn test() {
         Some(serde_json::json!([{ "additionalHooks": "useSpecialEffect" }])),
     )];
 
+    let fix = vec![
+        // Test case 1: Add missing dependency array for useMemo
+        (
+            r"function MyComponent() {
+              const value = useMemo(() => { return 2*2; });
+            }",
+            r"function MyComponent() {
+              const value = useMemo(() => { return 2*2; }, []);
+            }",
+            None,
+        ),
+        // Test case 2: Add missing dependency array for useCallback
+        (
+            r"function MyComponent() {
+              const fn = useCallback(() => { alert('foo'); });
+            }",
+            r"function MyComponent() {
+              const fn = useCallback(() => { alert('foo'); }, []);
+            }",
+            None,
+        ),
+        // Test case 3: Add missing dependency to existing array
+        (
+            r"function MyComponent() {
+              const local = someFunc();
+              useEffect(() => {
+                console.log(local);
+              }, []);
+            }",
+            r"function MyComponent() {
+              const local = someFunc();
+              useEffect(() => {
+                console.log(local);
+              }, [local]);
+            }",
+            None,
+        ),
+        // Test case 4: Remove literal dependencies
+        (
+            r"function MyComponent() {
+              useEffect(() => {}, ['foo']);
+            }",
+            r"function MyComponent() {
+              useEffect(() => {}, []);
+            }",
+            None,
+        ),
+    ];
+
     Tester::new(
         ExhaustiveDeps::NAME,
         ExhaustiveDeps::PLUGIN,
         pass.iter().map(|&code| (code, None)).chain(pass_additional_hooks).collect::<Vec<_>>(),
         fail.iter().map(|&code| (code, None)).chain(fail_additional_hooks).collect::<Vec<_>>(),
     )
+    .expect_fix(fix)
     .test_and_snapshot();
+}
+
+// Helper functions for dependency array fixes
+fn extract_dependency_names_from_array<'a>(
+    array_expr: &ArrayExpression<'a>,
+    semantic: &Semantic<'a>,
+) -> Vec<String> {
+    array_expr
+        .elements
+        .iter()
+        .filter_map(|elem| match elem {
+            ArrayExpressionElement::Elision(_) => None,
+            ArrayExpressionElement::SpreadElement(_) => None,
+            match_expression!(ArrayExpressionElement) => {
+                let expr = elem.to_expression().get_inner_expression();
+                match expr {
+                    Expression::Identifier(ident) => Some(ident.name.to_string()),
+                    Expression::StaticMemberExpression(_) | Expression::ChainExpression(_) => {
+                        // Handle property chains like props.foo.bar
+                        if let Ok(Some(dep)) = analyze_property_chain(expr, semantic) {
+                            Some(dep.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .collect()
+}
+
+fn format_dependency_array(deps: &[String]) -> String {
+    if deps.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", deps.join(", "))
+    }
+}
+
+fn merge_dependencies(existing: Vec<String>, missing: &[String]) -> Vec<String> {
+    let mut result = existing;
+    for dep in missing {
+        if !result.contains(dep) {
+            result.push(dep.clone());
+        }
+    }
+    result
+}
+
+
+fn is_literal_expression(expr: &Expression) -> bool {
+    matches!(
+        expr.get_inner_expression(),
+        Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::StringLiteral(_)
+    )
+}
+
+fn extract_non_literal_dependencies<'a>(
+    array_expr: &ArrayExpression<'a>,
+    semantic: &Semantic<'a>,
+) -> Vec<String> {
+    array_expr
+        .elements
+        .iter()
+        .filter_map(|elem| match elem {
+            ArrayExpressionElement::Elision(_) => None,
+            ArrayExpressionElement::SpreadElement(_) => None,
+            match_expression!(ArrayExpressionElement) => {
+                let expr = elem.to_expression().get_inner_expression();
+                if is_literal_expression(expr) {
+                    None // Skip literals
+                } else {
+                    match expr {
+                        Expression::Identifier(ident) => Some(ident.name.to_string()),
+                        Expression::StaticMemberExpression(_) | Expression::ChainExpression(_) => {
+                            if let Ok(Some(dep)) = analyze_property_chain(expr, semantic) {
+                                Some(dep.to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn has_literal_dependencies(array_expr: &ArrayExpression) -> bool {
+    array_expr.elements.iter().any(|elem| match elem {
+        ArrayExpressionElement::Elision(_) | ArrayExpressionElement::SpreadElement(_) => false,
+        match_expression!(ArrayExpressionElement) => {
+            is_literal_expression(elem.to_expression().get_inner_expression())
+        }
+    })
+}
+
+// Fix functions for Phase 1 (safest fixes) - simplified approach
+
+/// Check if it's safe to apply a fix for missing dependencies
+fn is_safe_to_fix_missing_dependencies(
+    missing_deps: &[String],
+    _found_dependencies: &FxHashSet<Dependency>,
+) -> bool {
+    // Only fix if all missing dependencies are simple identifiers or member expressions
+    // Avoid fixing complex cases that might change semantics
+    missing_deps.len() <= 3 && // Limit to avoid overwhelming changes
+    missing_deps.iter().all(|dep| {
+        // Check if dependency name is simple (no complex expressions)
+        dep.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+    })
+}
+
+/// Check if it's safe to remove literal dependencies
+fn is_safe_to_fix_literals(dependencies_node: &ArrayExpression) -> bool {
+    // Always safe to remove literals since they never change
+    has_literal_dependencies(dependencies_node)
+}
+
+/// Check if it's safe to add dependency array for hooks that require it
+fn is_safe_to_add_dependency_array(hook_name: &str) -> bool {
+    // Only safe for hooks that are useless without dependencies
+    HOOKS_USELESS_WITHOUT_DEPENDENCIES.contains(&hook_name)
 }
