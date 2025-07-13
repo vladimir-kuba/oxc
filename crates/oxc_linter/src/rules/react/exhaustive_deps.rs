@@ -494,6 +494,10 @@ impl Rule for ExhaustiveDeps {
             return;
         };
 
+        // Check if we have literals and apply a single fix for the entire array
+        let has_literals = has_literal_dependencies(dependencies_node);
+        let mut literal_fix_applied = false;
+
         let declared_dependencies_iter =
             dependencies_node.elements.iter().filter_map(|elem| match elem {
                 ArrayExpressionElement::Elision(_) => None,
@@ -507,7 +511,23 @@ impl Rule for ExhaustiveDeps {
                 match_expression!(ArrayExpressionElement) => {
                     let elem = elem.to_expression().get_inner_expression();
 
-                    if let Ok(dep) = analyze_property_chain(elem, ctx) {
+                    // Check if this is a literal and report it
+                    if is_literal_expression(elem) {
+                        if has_literals && is_safe_to_fix_literals(dependencies_node) && !literal_fix_applied {
+                            ctx.diagnostic_with_fix(
+                                literal_in_dependency_array_diagnostic(elem.span()),
+                                |fixer| {
+                                    let non_literal_deps = extract_non_literal_dependencies(dependencies_node, ctx.semantic());
+                                    let new_array_content = format_dependency_array(&non_literal_deps);
+                                    fixer.replace(dependencies_node.span, new_array_content)
+                                }
+                            );
+                            literal_fix_applied = true;
+                        } else if !literal_fix_applied {
+                            ctx.diagnostic(literal_in_dependency_array_diagnostic(elem.span()));
+                        }
+                        None
+                    } else if let Ok(dep) = analyze_property_chain(elem, ctx) {
                         dep
                     } else {
                         ctx.diagnostic(complex_expression_in_dependency_array_diagnostic(
@@ -530,16 +550,6 @@ impl Rule for ExhaustiveDeps {
 
             declared_dependencies
         };
-
-        // Apply literal dependency fix if safe
-        if is_safe_to_fix_literals(dependencies_node) {
-            let diagnostic = literal_in_dependency_array_diagnostic(dependencies_node.span);
-            ctx.diagnostic_with_fix(diagnostic, |fixer| {
-                let non_literal_deps = extract_non_literal_dependencies(dependencies_node, ctx.semantic());
-                let new_array_content = format_dependency_array(&non_literal_deps);
-                fixer.replace(dependencies_node.span, new_array_content)
-            });
-        }
 
         for dependency in &declared_dependencies {
             if let Some(symbol_id) = dependency.symbol_id {
@@ -608,22 +618,49 @@ impl Rule for ExhaustiveDeps {
             let unnecessary_deps: Vec<_> =
                 declared_dependencies.difference(&found_dependencies).collect();
 
+            // Collect all unnecessary dependencies for potential fixing
+            let mut all_unnecessary_deps = Vec::new();
+
             // lastly, we need co compare for any unnecessary deps
             // for example if `props.foo`, AND `props.foo.bar.baz` was declared in the deps array
             // `props.foo.bar.baz` is unnecessary (already covered by `props.foo`)
             declared_dependencies.iter().tuple_combinations().for_each(|(a, b)| {
                 if a.contains(b) {
-                    ctx.diagnostic(unnecessary_dependency_diagnostic(
-                        hook_name,
-                        &a.to_string(),
-                        dependencies_node.span,
-                    ));
+                    all_unnecessary_deps.push(a.to_string());
+                    if is_safe_to_fix_unnecessary_dependencies(&[a.to_string()], dependencies_node) {
+                        ctx.diagnostic_with_fix(
+                            unnecessary_dependency_diagnostic(hook_name, &a.to_string(), dependencies_node.span),
+                            |fixer| {
+                                let remaining_deps = remove_dependency_from_array(dependencies_node, &a.to_string(), ctx.semantic());
+                                let new_array_content = format_dependency_array(&remaining_deps);
+                                fixer.replace(dependencies_node.span, new_array_content)
+                            }
+                        );
+                    } else {
+                        ctx.diagnostic(unnecessary_dependency_diagnostic(
+                            hook_name,
+                            &a.to_string(),
+                            dependencies_node.span,
+                        ));
+                    }
                 } else if b.contains(a) {
-                    ctx.diagnostic(unnecessary_dependency_diagnostic(
-                        hook_name,
-                        &b.to_string(),
-                        dependencies_node.span,
-                    ));
+                    all_unnecessary_deps.push(b.to_string());
+                    if is_safe_to_fix_unnecessary_dependencies(&[b.to_string()], dependencies_node) {
+                        ctx.diagnostic_with_fix(
+                            unnecessary_dependency_diagnostic(hook_name, &b.to_string(), dependencies_node.span),
+                            |fixer| {
+                                let remaining_deps = remove_dependency_from_array(dependencies_node, &b.to_string(), ctx.semantic());
+                                let new_array_content = format_dependency_array(&remaining_deps);
+                                fixer.replace(dependencies_node.span, new_array_content)
+                            }
+                        );
+                    } else {
+                        ctx.diagnostic(unnecessary_dependency_diagnostic(
+                            hook_name,
+                            &b.to_string(),
+                            dependencies_node.span,
+                        ));
+                    }
                 }
             });
 
@@ -632,11 +669,25 @@ impl Rule for ExhaustiveDeps {
                     continue;
                 }
 
-                ctx.diagnostic(unnecessary_dependency_diagnostic(
-                    hook_name,
-                    &dep.to_string(),
-                    dependencies_node.span,
-                ));
+                let dep_string = dep.to_string();
+                all_unnecessary_deps.push(dep_string.clone());
+                
+                if is_safe_to_fix_unnecessary_dependencies(&[dep_string.clone()], dependencies_node) {
+                    ctx.diagnostic_with_fix(
+                        unnecessary_dependency_diagnostic(hook_name, &dep_string, dependencies_node.span),
+                        |fixer| {
+                            let remaining_deps = remove_dependency_from_array(dependencies_node, &dep_string, ctx.semantic());
+                            let new_array_content = format_dependency_array(&remaining_deps);
+                            fixer.replace(dependencies_node.span, new_array_content)
+                        }
+                    );
+                } else {
+                    ctx.diagnostic(unnecessary_dependency_diagnostic(
+                        hook_name,
+                        &dep_string,
+                        dependencies_node.span,
+                    ));
+                }
             }
         }
 
@@ -4169,4 +4220,60 @@ fn is_safe_to_fix_literals(dependencies_node: &ArrayExpression) -> bool {
 fn is_safe_to_add_dependency_array(hook_name: &str) -> bool {
     // Only safe for hooks that are useless without dependencies
     HOOKS_USELESS_WITHOUT_DEPENDENCIES.contains(&hook_name)
+}
+
+/// Check if it's safe to remove unnecessary dependencies
+fn is_safe_to_fix_unnecessary_dependencies(
+    unnecessary_deps: &[String],
+    dependencies_node: &ArrayExpression,
+) -> bool {
+    // Only fix if we have a small number of unnecessary dependencies
+    // and the dependency array is not too complex
+    unnecessary_deps.len() <= 2 &&
+    dependencies_node.elements.len() <= 10 &&
+    unnecessary_deps.iter().all(|dep| {
+        // Check if dependency name is simple (no complex expressions)
+        dep.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+    })
+}
+
+/// Remove a specific dependency from the dependency array
+fn remove_dependency_from_array<'a>(
+    array_expr: &ArrayExpression<'a>,
+    dep_to_remove: &str,
+    semantic: &Semantic<'a>,
+) -> Vec<String> {
+    array_expr
+        .elements
+        .iter()
+        .filter_map(|elem| match elem {
+            ArrayExpressionElement::Elision(_) => None,
+            ArrayExpressionElement::SpreadElement(_) => None,
+            match_expression!(ArrayExpressionElement) => {
+                let expr = elem.to_expression().get_inner_expression();
+                let dep_string = match expr {
+                    Expression::Identifier(ident) => Some(ident.name.to_string()),
+                    Expression::StaticMemberExpression(_) | Expression::ChainExpression(_) => {
+                        if let Ok(Some(dep)) = analyze_property_chain(expr, semantic) {
+                            Some(dep.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                
+                // Keep the dependency if it's not the one we want to remove
+                if let Some(dep_str) = dep_string {
+                    if dep_str != dep_to_remove {
+                        Some(dep_str)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        })
+        .collect()
 }
