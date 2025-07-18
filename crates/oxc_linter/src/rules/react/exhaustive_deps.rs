@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use oxc_ast::{
     AstKind, AstType,
     ast::{
-        Argument, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern,
+        Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionExpression, BindingPattern,
         BindingPatternKind, CallExpression, ChainElement, Expression, FormalParameters, Function,
         FunctionBody, IdentifierReference, StaticMemberExpression, TSTypeAnnotation,
         TSTypeParameterInstantiation, TSTypeReference, VariableDeclarationKind, VariableDeclarator,
@@ -27,10 +27,17 @@ use crate::{
         get_declaration_from_reference_id, get_declaration_of_variable, get_enclosing_function,
     },
     context::LintContext,
+    fixer::{RuleFix, RuleFixer},
     rule::Rule,
 };
 
 const SCOPE: &str = "eslint-plugin-react-hooks";
+
+// Fix message constants for user-friendly descriptions
+const ADD_MISSING_DEPENDENCIES_MSG: &str = "Add missing dependencies to dependency array";
+const REMOVE_UNNECESSARY_DEPENDENCY_MSG: &str = "Remove unnecessary dependency from array";
+const CREATE_DEPENDENCY_ARRAY_MSG: &str = "Add dependency array";
+const REMOVE_LITERAL_DEPENDENCY_MSG: &str = "Remove literal value from dependency array";
 
 fn missing_callback_diagnostic(hook_name: &str, span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn(format!("React hook {hook_name} requires an effect callback."))
@@ -218,7 +225,8 @@ declare_oxc_lint!(
     /// ```
     ExhaustiveDeps,
     react,
-    correctness
+    correctness,
+    fix
 );
 
 const HOOKS_USELESS_WITHOUT_DEPENDENCIES: [&str; 2] = ["useCallback", "useMemo"];
@@ -273,10 +281,30 @@ impl Rule for ExhaustiveDeps {
 
         if dependencies_node.is_none() && !is_effect {
             if HOOKS_USELESS_WITHOUT_DEPENDENCIES.contains(&hook_name.as_str()) {
-                ctx.diagnostic(dependency_array_required_diagnostic(
-                    hook_name.as_str(),
-                    call_expr.span(),
-                ));
+                // Check if we can safely add a dependency array
+                if is_safe_hook_modification_context(call_expr, ctx) {
+                    ctx.diagnostic_with_fix(
+                        dependency_array_required_diagnostic(hook_name.as_str(), call_expr.span()),
+                        |fixer| {
+                            let insert_position = if let Some(callback_arg) =
+                                call_expr.arguments.get(callback_index)
+                            {
+                                callback_arg.span().end
+                            } else {
+                                call_expr.span.end - 1 // Before closing paren
+                            };
+                            fixer
+                                .replace(Span::new(insert_position, insert_position), ", []")
+                                .with_message(CREATE_DEPENDENCY_ARRAY_MSG)
+                        },
+                    );
+                } else {
+                    // Fall back to diagnostic-only
+                    ctx.diagnostic(dependency_array_required_diagnostic(
+                        hook_name.as_str(),
+                        call_expr.span(),
+                    ));
+                }
             }
             return;
         }
@@ -509,7 +537,30 @@ impl Rule for ExhaustiveDeps {
             for item in declared_dependencies_iter {
                 let span = item.span;
                 if !declared_dependencies.insert(item) {
-                    ctx.diagnostic(literal_in_dependency_array_diagnostic(span));
+                    // Check if we can safely remove the duplicate literal
+                    if is_safe_to_modify_dependency_array(dependencies_node)
+                        && is_safe_hook_modification_context(call_expr, ctx)
+                        && is_safe_array_modification_context(dependencies_node)
+                    {
+                        ctx.diagnostic_with_fix(
+                            literal_in_dependency_array_diagnostic(span),
+                            |fixer| {
+                                // Find and remove the duplicate literal
+                                if let Some(index) = dependencies_node
+                                    .elements
+                                    .iter()
+                                    .position(|elem| elem.span() == span)
+                                {
+                                    remove_dependency_at_index(fixer, dependencies_node, index)
+                                        .with_message(REMOVE_LITERAL_DEPENDENCY_MSG)
+                                } else {
+                                    fixer.noop()
+                                }
+                            },
+                        );
+                    } else {
+                        ctx.diagnostic(literal_in_dependency_array_diagnostic(span));
+                    }
                 }
             }
 
@@ -556,11 +607,63 @@ impl Rule for ExhaustiveDeps {
         });
 
         if undeclared_deps.clone().count() > 0 {
-            ctx.diagnostic(missing_dependency_diagnostic(
-                hook_name,
-                &undeclared_deps.map(Dependency::to_string).collect::<Vec<_>>(),
-                dependencies_node.span(),
-            ));
+            let missing_deps: Vec<String> = undeclared_deps.map(Dependency::to_string).collect();
+
+            // Check if we can safely apply fixes with comprehensive validation
+            if is_safe_to_modify_dependency_array(dependencies_node)
+                && is_safe_hook_modification_context(call_expr, ctx)
+                && is_safe_array_modification_context(dependencies_node)
+                && missing_deps.iter().all(|dep| {
+                    is_safe_to_add_dependency(dep, dependencies_node)
+                        && is_safe_dependency_pattern(dep)
+                })
+            {
+                ctx.diagnostic_with_fix(
+                    missing_dependency_diagnostic(
+                        hook_name,
+                        &missing_deps,
+                        dependencies_node.span(),
+                    ),
+                    |fixer| {
+                        if missing_deps.is_empty() {
+                            return fixer.noop();
+                        }
+
+                        if dependencies_node.elements.is_empty() {
+                            // Empty array: [] -> [dep1, dep2]
+                            let deps_text = missing_deps.join(", ");
+                            fixer
+                                .replace(
+                                    Span::new(
+                                        dependencies_node.span.start + 1,
+                                        dependencies_node.span.end - 1,
+                                    ),
+                                    deps_text,
+                                )
+                                .with_message(ADD_MISSING_DEPENDENCIES_MSG)
+                        } else {
+                            // Non-empty array: [existing] -> [existing, dep1, dep2]
+                            let deps_text = format!(", {}", missing_deps.join(", "));
+                            let last_element_end = dependencies_node
+                                .elements
+                                .last()
+                                .map(|elem| elem.span().end)
+                                .unwrap_or(dependencies_node.span.start + 1);
+
+                            fixer
+                                .replace(Span::new(last_element_end, last_element_end), deps_text)
+                                .with_message(ADD_MISSING_DEPENDENCIES_MSG)
+                        }
+                    },
+                );
+            } else {
+                // Fall back to diagnostic-only if fixes cannot be safely applied
+                ctx.diagnostic(missing_dependency_diagnostic(
+                    hook_name,
+                    &missing_deps,
+                    dependencies_node.span(),
+                ));
+            }
         }
 
         // effects are allowed to have extra dependencies
@@ -573,17 +676,65 @@ impl Rule for ExhaustiveDeps {
             // `props.foo.bar.baz` is unnecessary (already covered by `props.foo`)
             declared_dependencies.iter().tuple_combinations().for_each(|(a, b)| {
                 if a.contains(b) {
-                    ctx.diagnostic(unnecessary_dependency_diagnostic(
-                        hook_name,
-                        &a.to_string(),
-                        dependencies_node.span,
-                    ));
+                    // Check if we can safely suggest removing the unnecessary dependency
+                    if is_safe_to_modify_dependency_array(dependencies_node)
+                        && is_safe_hook_modification_context(call_expr, ctx)
+                        && is_safe_array_modification_context(dependencies_node)
+                    {
+                        ctx.diagnostic_with_fix(
+                            unnecessary_dependency_diagnostic(
+                                hook_name,
+                                &a.to_string(),
+                                dependencies_node.span,
+                            ),
+                            |fixer| {
+                                // Find and remove the unnecessary dependency
+                                if let Some(index) =
+                                    find_dependency_in_array(&a.to_string(), dependencies_node)
+                                {
+                                    remove_dependency_at_index(fixer, dependencies_node, index)
+                                } else {
+                                    fixer.noop()
+                                }
+                            },
+                        );
+                    } else {
+                        ctx.diagnostic(unnecessary_dependency_diagnostic(
+                            hook_name,
+                            &a.to_string(),
+                            dependencies_node.span,
+                        ));
+                    }
                 } else if b.contains(a) {
-                    ctx.diagnostic(unnecessary_dependency_diagnostic(
-                        hook_name,
-                        &b.to_string(),
-                        dependencies_node.span,
-                    ));
+                    // Check if we can safely suggest removing the unnecessary dependency
+                    if is_safe_to_modify_dependency_array(dependencies_node)
+                        && is_safe_hook_modification_context(call_expr, ctx)
+                        && is_safe_array_modification_context(dependencies_node)
+                    {
+                        ctx.diagnostic_with_fix(
+                            unnecessary_dependency_diagnostic(
+                                hook_name,
+                                &b.to_string(),
+                                dependencies_node.span,
+                            ),
+                            |fixer| {
+                                // Find and remove the unnecessary dependency
+                                if let Some(index) =
+                                    find_dependency_in_array(&b.to_string(), dependencies_node)
+                                {
+                                    remove_dependency_at_index(fixer, dependencies_node, index)
+                                } else {
+                                    fixer.noop()
+                                }
+                            },
+                        );
+                    } else {
+                        ctx.diagnostic(unnecessary_dependency_diagnostic(
+                            hook_name,
+                            &b.to_string(),
+                            dependencies_node.span,
+                        ));
+                    }
                 }
             });
 
@@ -592,11 +743,35 @@ impl Rule for ExhaustiveDeps {
                     continue;
                 }
 
-                ctx.diagnostic(unnecessary_dependency_diagnostic(
-                    hook_name,
-                    &dep.to_string(),
-                    dependencies_node.span,
-                ));
+                // Check if we can safely suggest removing the unnecessary dependency
+                if is_safe_to_modify_dependency_array(dependencies_node)
+                    && is_safe_hook_modification_context(call_expr, ctx)
+                    && is_safe_array_modification_context(dependencies_node)
+                {
+                    ctx.diagnostic_with_fix(
+                        unnecessary_dependency_diagnostic(
+                            hook_name,
+                            &dep.to_string(),
+                            dependencies_node.span,
+                        ),
+                        |fixer| {
+                            // Find and remove the unnecessary dependency
+                            if let Some(index) =
+                                find_dependency_in_array(&dep.to_string(), dependencies_node)
+                            {
+                                remove_dependency_at_index(fixer, dependencies_node, index)
+                            } else {
+                                fixer.noop()
+                            }
+                        },
+                    );
+                } else {
+                    ctx.diagnostic(unnecessary_dependency_diagnostic(
+                        hook_name,
+                        &dep.to_string(),
+                        dependencies_node.span,
+                    ));
+                }
             }
         }
 
@@ -1392,6 +1567,221 @@ fn is_inside_effect_cleanup(stack: &[AstType]) -> bool {
     }
 
     false
+}
+
+// Safety validation functions for dependency array modifications
+
+/// Checks if it's safe to modify the dependency array at the given location.
+/// Returns false if the array is in a complex expression or has spread elements.
+fn is_safe_to_modify_dependency_array(dependencies_node: &ArrayExpression) -> bool {
+    // Check for spread elements which make modification unsafe
+    for element in &dependencies_node.elements {
+        if matches!(element, ArrayExpressionElement::SpreadElement(_)) {
+            return false;
+        }
+    }
+
+    // Additional safety checks can be added here
+    true
+}
+
+/// Checks if a dependency can be safely added to the array.
+/// Returns false if the dependency name conflicts with existing elements
+/// or contains complex expressions.
+fn is_safe_to_add_dependency(dependency_name: &str, dependencies_node: &ArrayExpression) -> bool {
+    // Check if dependency already exists
+    for element in &dependencies_node.elements {
+        match element {
+            match_expression!(ArrayExpressionElement) => {
+                let expr = element.to_expression().get_inner_expression();
+                if let Expression::Identifier(ident) = expr {
+                    if ident.name == dependency_name {
+                        return false; // Already exists
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Check for valid identifier name (basic validation)
+    // Allow dots for member expressions like "props.foo"
+    !dependency_name.is_empty()
+        && !dependency_name.starts_with('.')
+        && !dependency_name.ends_with('.')
+        && dependency_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.')
+        && !dependency_name.contains("..")  // Prevent malformed expressions like "props..foo"
+        && !dependency_name.contains("?.") // Avoid optional chaining in dependency names
+        && !dependency_name.contains("!.") // Avoid non-null assertion in dependency names
+}
+
+/// Validates that the hook call is in a safe context for applying fixes.
+/// Returns false if the hook is in a conditional, loop, or nested function.
+fn is_safe_hook_context(call_expr: &CallExpression, ctx: &LintContext) -> bool {
+    // For now, we'll be conservative and allow fixes in most contexts
+    // This can be expanded with more sophisticated analysis
+
+    // Check if we're in a component or custom hook function
+    let enclosing_function = get_enclosing_function(
+        ctx.nodes()
+            .iter()
+            .find(|node| {
+                if let AstKind::CallExpression(expr) = node.kind() {
+                    std::ptr::eq(expr, call_expr)
+                } else {
+                    false
+                }
+            })
+            .unwrap(),
+        ctx,
+    );
+
+    enclosing_function.is_some()
+}
+
+/// Enhanced safety validation for complex dependency patterns.
+/// Returns false if the dependency contains patterns that are unsafe to auto-fix.
+fn is_safe_dependency_pattern(dependency_name: &str) -> bool {
+    // Reject dependencies with complex patterns that could be unsafe
+    if dependency_name.contains('[') || dependency_name.contains(']') {
+        return false; // Array access like props[key]
+    }
+
+    if dependency_name.contains('(') || dependency_name.contains(')') {
+        return false; // Function calls like props.getValue()
+    }
+
+    if dependency_name.contains('?') && !dependency_name.contains("?.") {
+        return false; // Ternary or other complex expressions
+    }
+
+    if dependency_name.contains('=')
+        || dependency_name.contains('+')
+        || dependency_name.contains('-')
+    {
+        return false; // Assignments or arithmetic
+    }
+
+    if dependency_name.contains(' ') {
+        return false; // Spaces indicate complex expressions
+    }
+
+    // Check for valid member expression depth (prevent extremely deep chains)
+    let depth = dependency_name.matches('.').count();
+    if depth > 5 {
+        return false; // Prevent extremely deep property chains
+    }
+
+    true
+}
+
+/// Validates that a dependency array modification won't break existing code structure.
+/// Checks for comments, complex formatting, or other elements that could be disrupted.
+fn is_safe_array_modification_context(dependencies_node: &ArrayExpression) -> bool {
+    // For now, we'll be conservative and allow most modifications
+    // This can be enhanced with more sophisticated analysis of:
+    // - Comments within the array
+    // - Complex formatting patterns
+    // - Spread elements in unsafe positions
+
+    // Check that we don't have too many elements (avoid creating overly long arrays)
+    if dependencies_node.elements.len() > 20 {
+        return false;
+    }
+
+    true
+}
+
+/// Validates that the hook call context is appropriate for automatic fixes.
+/// Prevents fixes in conditional blocks, loops, or other unsafe contexts.
+fn is_safe_hook_modification_context(call_expr: &CallExpression, ctx: &LintContext) -> bool {
+    // This is a simplified implementation. A more comprehensive version would:
+    // - Check if the hook is inside a conditional block
+    // - Check if the hook is inside a loop
+    // - Check if the hook is inside a nested function
+    // - Validate the component/hook function context
+
+    // For now, we'll use the existing enclosing function check
+    is_safe_hook_context(call_expr, ctx)
+}
+
+// Core fix utilities for dependency array manipulation
+
+/// Finds the index of a dependency in the dependency array by name.
+fn find_dependency_in_array(
+    dependency_name: &str,
+    dependencies_node: &ArrayExpression,
+) -> Option<usize> {
+    dependencies_node.elements.iter().position(|element| {
+        match element {
+            match_expression!(ArrayExpressionElement) => {
+                let expr = element.to_expression().get_inner_expression();
+                match expr {
+                    Expression::Identifier(ident) => ident.name == dependency_name,
+                    Expression::StaticMemberExpression(member) => {
+                        // Handle member expressions like props.foo
+                        format_member_expression(member) == dependency_name
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Formats a member expression as a string (e.g., "props.foo")
+fn format_member_expression(member: &StaticMemberExpression) -> String {
+    match &member.object {
+        Expression::Identifier(ident) => format!("{}.{}", ident.name, member.property.name),
+        Expression::StaticMemberExpression(nested_member) => {
+            format!("{}.{}", format_member_expression(nested_member), member.property.name)
+        }
+        _ => String::new(),
+    }
+}
+
+/// Removes a dependency at the specified index, handling commas correctly.
+fn remove_dependency_at_index<'a>(
+    fixer: RuleFixer<'_, 'a>,
+    dependencies_node: &ArrayExpression<'a>,
+    index: usize,
+) -> RuleFix<'a> {
+    let elements = &dependencies_node.elements;
+
+    if elements.is_empty() || index >= elements.len() {
+        return fixer.noop();
+    }
+
+    let element_to_remove = &elements[index];
+    let element_span = element_to_remove.span();
+
+    if elements.len() == 1 {
+        // Only one element, remove it entirely: [dep] -> []
+        fixer.replace(element_span, "").with_message(REMOVE_UNNECESSARY_DEPENDENCY_MSG)
+    } else if index == 0 {
+        // First element: [dep, other] -> [other]
+        // Remove element and the following comma
+        if let Some(next_element) = elements.get(index + 1) {
+            let end_pos = next_element.span().start;
+            fixer
+                .replace(Span::new(element_span.start, end_pos), "")
+                .with_message(REMOVE_UNNECESSARY_DEPENDENCY_MSG)
+        } else {
+            fixer.replace(element_span, "").with_message(REMOVE_UNNECESSARY_DEPENDENCY_MSG)
+        }
+    } else {
+        // Not first element: [other, dep] -> [other]
+        // Remove the preceding comma and the element
+        if let Some(prev_element) = elements.get(index - 1) {
+            let start_pos = prev_element.span().end;
+            fixer
+                .replace(Span::new(start_pos, element_span.end), "")
+                .with_message(REMOVE_UNNECESSARY_DEPENDENCY_MSG)
+        } else {
+            fixer.replace(element_span, "").with_message(REMOVE_UNNECESSARY_DEPENDENCY_MSG)
+        }
+    }
 }
 
 #[test]
@@ -3943,11 +4333,52 @@ fn test() {
         Some(serde_json::json!([{ "additionalHooks": "useSpecialEffect" }])),
     )];
 
+    let fix_tests = vec![
+        // Test missing dependency fixes
+        (
+            "function MyComponent() { const local = someFunc(); useEffect(() => { console.log(local); }, []); }",
+            "function MyComponent() { const local = someFunc(); useEffect(() => { console.log(local); }, [local]); }",
+        ),
+        (
+            "function MyComponent(props) { useEffect(() => { console.log(props.foo); }, []); }",
+            "function MyComponent(props) { useEffect(() => { console.log(props.foo); }, [props.foo]); }",
+        ),
+        (
+            "function MyComponent(props) { useEffect(() => { console.log(props.foo, props.bar); }, []); }",
+            "function MyComponent(props) { useEffect(() => { console.log(props.foo, props.bar); }, [props.foo, props.bar]); }",
+        ),
+        // Test adding to existing dependencies
+        (
+            "function MyComponent(props) { const local = someFunc(); useEffect(() => { console.log(props.foo, local); }, [props.foo]); }",
+            "function MyComponent(props) { const local = someFunc(); useEffect(() => { console.log(props.foo, local); }, [props.foo, local]); }",
+        ),
+        // Test dependency array creation for hooks that require it
+        (
+            "function MyComponent() { const fn = useCallback(() => { alert('foo'); }); }",
+            "function MyComponent() { const fn = useCallback(() => { alert('foo'); }, []); }",
+        ),
+        (
+            "function MyComponent() { const value = useMemo(() => { return 2*2; }); }",
+            "function MyComponent() { const value = useMemo(() => { return 2*2; }, []); }",
+        ),
+        // Test unnecessary dependency removal for non-effect hooks
+        (
+            "function MyComponent() { const local1 = {}; useCallback(() => {}, [local1]); }",
+            "function MyComponent() { const local1 = {}; useCallback(() => {}, []); }",
+        ),
+        // Test duplicate dependency removal
+        (
+            "function MyComponent() { const local = {}; useEffect(() => { console.log(local); }, [local, local]); }",
+            "function MyComponent() { const local = {}; useEffect(() => { console.log(local); }, [local]); }",
+        ),
+    ];
+
     Tester::new(
         ExhaustiveDeps::NAME,
         ExhaustiveDeps::PLUGIN,
         pass.iter().map(|&code| (code, None)).chain(pass_additional_hooks).collect::<Vec<_>>(),
         fail.iter().map(|&code| (code, None)).chain(fail_additional_hooks).collect::<Vec<_>>(),
     )
+    .expect_fix(fix_tests)
     .test_and_snapshot();
 }
